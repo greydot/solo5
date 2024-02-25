@@ -74,6 +74,8 @@ static bool stepping = false;
 /* This is the trap instruction used for software breakpoints. */
 static const uint8_t int3 = 0xcc;
 
+uint16_t to_fsave_tag(uint16_t fsw, uint8_t tag, const struct fpu_reg regs[FPU_REGS]);
+
 static int kvm_arch_insert_sw_breakpoint(struct hvt *hvt, struct breakpoint_t *bp)
 {
     /* The address check at the GDB server just returned an error if addr was
@@ -288,8 +290,13 @@ int hvt_gdb_read_registers(struct hvt *hvt,
 {
     struct kvm_regs kregs;
     struct kvm_sregs sregs;
+    struct kvm_fpu fregs;
     struct hvt_gdb_regs *gregs = (struct hvt_gdb_regs *) registers;
     int ret;
+
+    if (*len < sizeof(struct hvt_gdb_regs))
+        return -1;
+    *len = sizeof(struct hvt_gdb_regs);
 
     ret = ioctl(hvt->b->vcpufd, KVM_GET_REGS, &kregs);
     if (ret == -1) {
@@ -299,14 +306,19 @@ int hvt_gdb_read_registers(struct hvt *hvt,
 
     ret = ioctl(hvt->b->vcpufd, KVM_GET_SREGS, &sregs);
     if (ret == -1) {
-        err(1, "KVM_GET_REGS");
+        err(1, "KVM_GET_SREGS");
         return -1;
     }
 
-    if (*len < sizeof(struct hvt_gdb_regs))
+    ret = ioctl(hvt->b->vcpufd, KVM_GET_FPU, &fregs);
+    if (ret == -1) {
+        err(1, "KVM_GET_FPU");
         return -1;
+    }
 
-    *len = sizeof(struct hvt_gdb_regs);
+    // There's a bunch of reserved areas in the FPU section.
+    // It's easier to just zero out everything.
+    memset(gregs, 0, sizeof(*gregs));
 
     gregs->rax = kregs.rax;
     gregs->rbx = kregs.rbx;
@@ -332,6 +344,22 @@ int hvt_gdb_read_registers(struct hvt *hvt,
     gregs->es = sregs.es.selector;
     gregs->fs = sregs.fs.selector;
     gregs->gs = sregs.gs.selector;
+
+    // Copy STx/MMx registers.
+    for(int i = 0; i < FPU_REGS; i++) {
+        memcpy(&gregs->st[i], fregs.fpr[i], sizeof(gregs->st[0]));
+    }
+    // Bottom 16 bits of these fields are reserved.
+    gregs->fctrl = (uint32_t)fregs.fcw << 16;
+    gregs->fstat = (uint32_t)fregs.fsw << 16;
+
+    gregs->ftag = to_fsave_tag(fregs.fsw, fregs.ftwx, gregs->st);
+    gregs->fop = fregs.last_opcode;
+
+    gregs->fiseg = (fregs.last_ip >> 32) & 0xffffffff;
+    gregs->fioff = fregs.last_ip & 0xffffffff;
+    gregs->foseg = (fregs.last_dp >> 32) & 0xffffffff;
+    gregs->fooff = fregs.last_dp & 0xffffffff;
 
     return 0;
 }
@@ -499,4 +527,51 @@ int hvt_gdb_read_last_signal(struct hvt *hvt, int *signal)
     }
 
     return 0;
+}
+
+// Convert FXSAVE tag to full tag format from FSAVE.
+// This is what GDB expects in its wire protocol for some dumb reason.
+uint16_t to_fsave_tag(uint16_t fsw, uint8_t tag, const struct fpu_reg regs[FPU_REGS])
+{
+  int stack_top = (fsw >> 11) & 0x7;
+
+  uint16_t fsave_tag = 0;
+  for (int phys_idx = 0; phys_idx < FPU_REGS; phys_idx++) {
+    bool fxsave_bit = (tag & (1 << phys_idx)) != 0;
+    uint8_t fsave_bits;
+
+    if (fxsave_bit) {
+      int st_idx = (phys_idx + FPU_REGS - stack_top) % FPU_REGS;
+      const unsigned char *st = regs[st_idx].data;
+
+      uint32_t exponent = ((st[9] & 0x7f) << 8) | st[8];
+      if (exponent == 0x7fff) {
+        // Infinity, NaN, pseudo-infinity, or pseudo-NaN.
+        // Mostly the case for MMX values.
+        fsave_bits = 2;
+      } else {
+        // J bit.
+        bool integer_bit = (st[7] & 0x80) != 0;
+        if (exponent == 0) {
+          uint64_t fraction = (((uint64_t)st[7] & 0x7f) << 56) |
+                              ((uint64_t)st[6] << 48) |
+                              ((uint64_t)st[5] << 40) |
+                              ((uint64_t)st[4] << 32) |
+                              ((uint64_t)(st[3]) << 24) |
+                              (st[2] << 16) | (st[1] << 8) | st[0];
+          fsave_bits = !integer_bit && !fraction ? 1 : 2;
+        } else if (integer_bit) {
+          fsave_bits = 0;
+        } else {
+          fsave_bits = 1;
+        }
+      }
+    } else {
+      fsave_bits = 3;
+    }
+
+    fsave_tag |= (fsave_bits << (phys_idx * 2));
+  }
+
+  return fsave_tag;
 }
